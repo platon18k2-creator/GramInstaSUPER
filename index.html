@@ -149,7 +149,7 @@ if(FIREBASE_READY){
     try{db=initializeFirestore(app,{localCache:persistentLocalCache({tabManager:persistentMultipleTabManager()})})}
     catch(e){db=getFirestore(app);}
     storage=getStorage(app);
-    await setPersistence(auth,browserLocalPersistence);
+    await withTimeout(setPersistence(auth,browserLocalPersistence),5000,'Сохранение сессии');
   } catch (e) {
     console.error("SuperGram Firebase initialization failed", e);
     window.__SUPERGRAM_FIREBASE_INIT_ERROR__ = e;
@@ -164,6 +164,13 @@ function dayLabel(ts){let d=ts?.toDate?ts.toDate():new Date(ts||Date.now());retu
 function usernameClean(v){return String(v||'').trim().replace(/^@/,'').toLowerCase()}
 function validUsername(v){return /^[a-z0-9_]{3,24}$/.test(v)}
 function authEmail(u){return `${u}@login.supergram.invalid`}
+function withTimeout(promise,ms=8000,label='Операция'){
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label} превысила лимит ожидания. Проверь Firebase/интернет.`)),ms)})
+  ]).finally(()=>clearTimeout(timer));
+}
 function initials(name='SG'){let a=String(name).trim().split(/\s+/).filter(Boolean);return (a.slice(0,2).map(x=>x[0]).join('')||'SG').toUpperCase()}
 function uidPair(a,b){return [a,b].sort().join('__')}
 function showSplash(sub='Подключаем SuperGram…',delay=850){$('splashSub').textContent=sub;$('splash').classList.remove('hide');setTimeout(()=>$('splash').classList.add('hide'),delay)}
@@ -172,20 +179,65 @@ function setConfigStatus(){const el=$('configStatus');if(!el)return;el.textConte
 function clearAuthErr(){$('authError').classList.add('hidden')}
 function setMode(m){authMode=m;clearAuthErr();$('loginTab').classList.toggle('active',m==='login');$('signupTab').classList.toggle('active',m==='signup');$('authTitle').textContent=m==='login'?'Вход в SuperGram':'Создание аккаунта';$('authSubmit').textContent=m==='login'?'Войти':'Создать аккаунт';$('confirmWrap').classList.toggle('hidden',m==='login');$('password2Wrap').classList.toggle('hidden',m==='login');}
 
-async function ensureUserDoc(u){const pRef=doc(db,'profiles',u.uid);const snap=await getDoc(pRef);if(snap.exists())return snap.data();const fallback={uid:u.uid,username:u.email.split('@')[0],name:u.displayName||u.email.split('@')[0],bio:'',photoURL:'',createdAt:serverTimestamp()};await setDoc(pRef,fallback);return fallback}
+async function ensureUserDoc(u){
+  const fallback={uid:u.uid,username:u.email.split('@')[0],name:u.displayName||u.email.split('@')[0],bio:'',photoURL:'',createdAt:serverTimestamp()};
+  if(!db)return fallback;
+  const pRef=doc(db,'profiles',u.uid);
+  try{
+    const snap=await withTimeout(getDoc(pRef),7000,'Загрузка профиля');
+    if(snap.exists())return snap.data();
+    await withTimeout(setDoc(pRef,fallback),7000,'Создание профиля');
+    return fallback;
+  }catch(e){
+    console.warn('Profile sync deferred:',e);
+    return fallback;
+  }
+}
 async function register(username,password,name){
   if(!FIREBASE_READY) throw new Error('FIREBASE_NOT_CONFIGURED');
-  const cred=await createUserWithEmailAndPassword(auth,authEmail(username),password);
+  const cred=await withTimeout(createUserWithEmailAndPassword(auth,authEmail(username),password),12000,'Регистрация');
   try{
-    await setDoc(doc(db,'usernames',username),{uid:cred.user.uid,username,createdAt:serverTimestamp()});
-  }catch(e){await deleteUser(cred.user);throw new Error('USERNAME_TAKEN');}
-  const profile={uid:cred.user.uid,username,name:name||username,bio:'',photoURL:'',createdAt:serverTimestamp()};await setDoc(doc(db,'profiles',cred.user.uid),profile);await updateProfile(cred.user,{displayName:profile.name});
+    const existing=await withTimeout(getDoc(doc(db,'usernames',username)),7000,'Проверка username');
+    if(existing.exists()){
+      await deleteUser(cred.user).catch(()=>{});
+      throw new Error('USERNAME_TAKEN');
+    }
+    await withTimeout(setDoc(doc(db,'usernames',username),{uid:cred.user.uid,username,createdAt:serverTimestamp()}),7000,'Сохранение username');
+  }catch(e){
+    if(e.message==='USERNAME_TAKEN'){throw e;}
+    await deleteUser(cred.user).catch(()=>{});
+    throw e;
+  }
+  const profile={uid:cred.user.uid,username,name:name||username,bio:'',photoURL:'',createdAt:serverTimestamp()};
+  await withTimeout(setDoc(doc(db,'profiles',cred.user.uid),profile),7000,'Сохранение профиля');
+  await updateProfile(cred.user,{displayName:profile.name});
 }
-async function resolveUsername(username){const s=await getDoc(doc(db,'usernames',username));if(!s.exists())return null;return s.data()}
+async function resolveUsername(username){
+  if(!db)throw new Error('Firebase Firestore не инициализирован.');
+  const s=await withTimeout(getDoc(doc(db,'usernames',username)),7000,'Поиск username');
+  if(!s.exists())return null;
+  return s.data();
+}
 
 $('loginTab').onclick=()=>setMode('login');$('signupTab').onclick=()=>setMode('signup');
 $('authForm').onsubmit=async e=>{e.preventDefault();clearAuthErr();const u=usernameClean($('username').value),p=$('password').value,n=$('displayName').value.trim(),p2=$('password2').value;if(!validUsername(u))return authErr('Username: 3–24 символа, только a–z, 0–9 и _.');if(p.length<6)return authErr('Пароль должен быть не короче 6 символов.');if(authMode==='signup'&&p!==p2)return authErr('Пароли не совпадают.');if(!FIREBASE_READY)return authErr('Firebase ещё не настроен. Открой README и вставь Web App config из Firebase Console.');
-  const btn=$('authSubmit');const old=btn.textContent;btn.textContent='Подключение…';try{if(authMode==='signup'){await register(u,p,n);showSplash('Аккаунт создан — создаём профиль…',950)}else{const found=await resolveUsername(u);if(!found)return authErr('Такого username нет.');await signInWithEmailAndPassword(auth,authEmail(u),p);showSplash('Добро пожаловать обратно…',850)}}catch(err){if(err.message==='USERNAME_TAKEN'||err.code==='auth/email-already-in-use')authErr('Этот username уже занят.');else if(err.code==='auth/invalid-credential'||err.code==='auth/wrong-password'||err.code==='auth/user-not-found')authErr('Неверный username или пароль.');else if(err.code==='auth/too-many-requests')authErr('Слишком много попыток. Попробуйте позже.');else authErr(err.message||'Не удалось выполнить вход.')}finally{btn.textContent=old}};
+  const btn=$('authSubmit');const old=btn.textContent;btn.textContent='Подключение…';btn.disabled=true;try{
+    if(authMode==='signup'){
+      await register(u,p,n);
+      showSplash('Аккаунт создан',700);
+    }else{
+      const found=await resolveUsername(u);
+      if(!found)return authErr('Такого username нет.');
+      await withTimeout(signInWithEmailAndPassword(auth,authEmail(u),p),12000,'Вход');
+      showSplash('Добро пожаловать',650);
+    }
+  }catch(err){
+    if(err.message==='USERNAME_TAKEN'||err.code==='auth/email-already-in-use')authErr('Этот username уже занят.');
+    else if(err.code==='auth/invalid-credential'||err.code==='auth/wrong-password'||err.code==='auth/user-not-found')authErr('Неверный username или пароль.');
+    else if(err.code==='auth/too-many-requests')authErr('Слишком много попыток. Попробуйте позже.');
+    else if(err.code==='auth/network-request-failed')authErr('Нет связи с Firebase. Проверь интернет и Authorized domains.');
+    else authErr(err.message||'Не удалось выполнить вход.');
+  }finally{btn.disabled=false;btn.textContent=old}};
 
 function setUiOnline(online=true){$('syncState').textContent=online?'realtime':'offline';$('syncState').classList.toggle('hidden',!online)}
 function showMain(){ $('auth').classList.add('hidden');$('main').classList.remove('hidden');setUiOnline(FIREBASE_READY); }
@@ -195,16 +247,29 @@ async function loadProfile(){currentProfile=await ensureUserDoc(currentUser);$('
 function renderAvatar(el,name,photo){el.innerHTML=photo?`<img src="${esc(photo)}" alt="">`:esc(initials(name));}
 
 async function startRealtime(){
+  if(!db||!currentUser)return;
   if(unsubscribeChats)unsubscribeChats();
   const q=query(collection(db,'conversations'),where('memberIds','array-contains',currentUser.uid),limit(100));
-  unsubscribeChats=onSnapshot(q,snap=>{chats.clear();snap.forEach(d=>chats.set(d.id,{id:d.id,...d.data()}));renderList();if(currentChatId&&chats.has(currentChatId))renderChatHeader(chats.get(currentChatId));},()=>{setUiOnline(false);toast('Realtime временно недоступен','bad')});
-  await loadFriends();
+  unsubscribeChats=onSnapshot(q,snap=>{
+    setUiOnline(true);
+    chats.clear();
+    snap.forEach(d=>chats.set(d.id,{id:d.id,...d.data()}));
+    renderList();
+    if(currentChatId&&chats.has(currentChatId))renderChatHeader(chats.get(currentChatId));
+  },e=>{setUiOnline(false);console.warn('Conversations listener:',e);toast('Чаты пока не синхронизированы. Проверь Firestore Rules.','bad')});
+  loadFriends().catch(e=>{console.warn('Friends sync:',e);setUiOnline(false)});
   loadFriendRequests();
 }
-async function loadFriends(){const q=query(collection(db,'friendships'),where('members','array-contains',currentUser.uid),where('status','==','accepted'),limit(200));const snap=await new Promise((resolve,reject)=>{const u=onSnapshot(q,s=>{u();resolve(s)},reject)});friendDocs=snap.docs.map(d=>({id:d.id,...d.data()}));renderList()}
+async function loadFriends(){
+  if(!db||!currentUser)return;
+  if(unsubFriendRequests){}
+  const q=query(collection(db,'friendships'),where('members','array-contains',currentUser.uid),where('status','==','accepted'),limit(200));
+  if(window.__sgFriendsUnsub)window.__sgFriendsUnsub();
+  window.__sgFriendsUnsub=onSnapshot(q,s=>{friendDocs=s.docs.map(d=>({id:d.id,...d.data()}));renderList()},e=>console.warn('Friends listener:',e));
+}
 let unsubFriendRequests=null;
 function loadFriendRequests(){if(unsubFriendRequests)unsubFriendRequests();const q=query(collection(db,'friendRequests'),where('toUid','==',currentUser.uid),where('status','==','pending'),limit(50));unsubFriendRequests=onSnapshot(q,s=>{if(s.size)toast(`Новых запросов в друзья: ${s.size}`)})}
-async function profileFor(uid){const s=await getDoc(doc(db,'profiles',uid));return s.exists()?s.data():{uid,username:'unknown',name:'Unknown',bio:''}}
+async function profileFor(uid){if(!db||!uid)return {uid,username:'unknown',name:'Unknown',bio:''};try{const s=await withTimeout(getDoc(doc(db,'profiles',uid)),6000,'Загрузка профиля');return s.exists()?s.data():{uid,username:'unknown',name:'Unknown',bio:''}}catch(e){return {uid,username:'unknown',name:'Unknown',bio:''}}}
 async function profilesFor(uids){const unique=[...new Set(uids.filter(Boolean))];const out=new Map();for(let i=0;i<unique.length;i+=20){await Promise.all(unique.slice(i,i+20).map(async u=>out.set(u,await profileFor(u))))}return out}
 function friendIds(){return friendDocs.map(d=>d.members.find(u=>u!==currentUser.uid)).filter(Boolean)}
 
@@ -288,7 +353,26 @@ if(!auth){
   setTimeout(()=>$('splash').classList.add('hide'),900);
 } else {
   $('configStatus').textContent='Firebase Authentication + Firestore + Storage подключены к этой сборке.';
-  onAuthStateChanged(auth,async user=>{if(user){currentUser=user;await loadProfile();showMain();await startRealtime();listenIncomingCalls();showSplash('Синхронизация чатов…',700)}else{showAuth();showSplash('SuperGram готов',500)}})
+  onAuthStateChanged(auth,user=>{
+    if(!user){
+      currentUser=null;currentProfile=null;
+      if(unsubscribeChats)unsubscribeChats();
+      if(unsubscribeMessages)unsubscribeMessages();
+      if(window.__sgFriendsUnsub)window.__sgFriendsUnsub();
+      showAuth();
+      showSplash('SuperGram готов',500);
+      return;
+    }
+    currentUser=user;
+    // IMPORTANT: never block the first paint on Firestore.
+    showMain();
+    showSplash('SuperGram запускается…',650);
+    Promise.resolve().then(async()=>{
+      try{await loadProfile();}catch(e){console.warn('Profile background sync:',e)}
+      try{startRealtime();}catch(e){console.warn('Realtime start:',e)}
+      try{listenIncomingCalls();}catch(e){console.warn('Calls listener:',e)}
+    });
+  });
 }
 
 // friends menu: double-click / extra action shortcut
@@ -445,7 +529,7 @@ $('micBtn').onclick=startVoiceEnhanced;document.addEventListener('keydown',e=>{i
 $('message').addEventListener('input',armTyping);$('message').addEventListener('blur',()=>setTyping(false));
 
 async function openChatEnhanced(id){
-  currentChatId=id;const c=chats.get(id)||{id};renderList();$('content').classList.add('mobile-show');$('topbar').classList.remove('hidden');$('composer').classList.remove('hidden');await renderChatHeaderEnhanced(c);if(unsubscribeMessages)unsubscribeMessages();listenTyping(id);const q=query(collection(db,'conversations',id,'messages'),orderBy('createdAt','asc'),limit(500));unsubscribeMessages=onSnapshot(q,async snap=>{await renderMessagesEnhanced(snap.docs.map(d=>({id:d.id,...d.data()})));},e=>toast('Не удалось загрузить сообщения: '+e.message,'bad'));
+  currentChatId=id;const c=chats.get(id)||{id};renderList();$('content').classList.add('mobile-show');$('topbar').classList.remove('hidden');$('composer').classList.remove('hidden');renderChatHeaderEnhanced(c).catch(()=>{});if(unsubscribeMessages)unsubscribeMessages();listenTyping(id);const q=query(collection(db,'conversations',id,'messages'),orderBy('createdAt','asc'),limit(500));unsubscribeMessages=onSnapshot(q,async snap=>{await renderMessagesEnhanced(snap.docs.map(d=>({id:d.id,...d.data()})));},e=>toast('Не удалось загрузить сообщения: '+e.message,'bad'));
 }
 openChat=openChatEnhanced;window.openChat=async id=>openChatEnhanced(id);
 
