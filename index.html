@@ -19,6 +19,15 @@
  radial-gradient(900px 680px at 110% 0%,rgba(124,92,255,.18),transparent 62%),
  linear-gradient(145deg,#050b13,#0a1524 60%,#08111e)}
 button,input,textarea{font:inherit}button{border:0;color:inherit;cursor:pointer}a{color:inherit}.hidden{display:none!important}
+/* Hard auth gate: the messenger GUI can never render before auth is resolved. */
+body.sg-preauth #main,
+body.sg-preauth #voiceRecording,
+body.sg-preauth #overlay,
+body.sg-preauth #toastWrap{display:none!important}
+body.sg-preauth #auth{display:grid!important}
+body.sg-authenticated #auth{display:none!important}
+body.sg-authenticated #main{display:grid!important}
+
 *::-webkit-scrollbar{width:9px;height:9px}*::-webkit-scrollbar-thumb{background:rgba(255,255,255,.09);border-radius:999px}*::-webkit-scrollbar-track{background:transparent}
 .app{height:100dvh;min-height:100dvh;padding:0;display:grid;place-items:stretch}.shell{width:100%;height:100dvh;min-height:0;position:relative;overflow:hidden;border:1px solid var(--line);border-radius:30px;background:rgba(8,15,27,.82);backdrop-filter:blur(24px);box-shadow:var(--shadow)}
 .bg-orb{position:absolute;border-radius:50%;filter:blur(15px);pointer-events:none}.bg-orb.a{width:280px;height:280px;left:-120px;top:25%;background:rgba(74,169,255,.12)}.bg-orb.b{width:360px;height:360px;right:-160px;bottom:-160px;background:rgba(124,92,255,.12)}
@@ -57,7 +66,7 @@ button,input,textarea{font:inherit}button{border:0;color:inherit;cursor:pointer}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 </style>
 </head>
-<body>
+<body class="sg-preauth">
 <div class="app"><div class="shell">
   <div class="bg-orb a"></div><div class="bg-orb b"></div>
   <div id="splash" class="splash"><div class="splash-inner"><div class="sg-card"><img id="splashLogo" class="logo-img" alt="SG"></div><div class="splash-title">SuperGram</div><div id="splashSub" class="splash-sub">Подключаем защищённую сессию…</div><div class="loader"><i></i><i></i><i></i></div></div></div>
@@ -181,7 +190,7 @@ function withTimeout(promise){
 }
 function initials(name='SG'){let a=String(name).trim().split(/\s+/).filter(Boolean);return (a.slice(0,2).map(x=>x[0]).join('')||'SG').toUpperCase()}
 function uidPair(a,b){return [a,b].sort().join('__')}
-function showSplash(sub='Подключаем SuperGram…',delay=850){$('splashSub').textContent=sub;$('splash').classList.remove('hide');setTimeout(()=>$('splash').classList.add('hide'),delay)}
+function showSplash(sub='Подключаем SuperGram…',delay=850){if(!currentUser && document.body.classList.contains('sg-preauth')) return;$('splashSub').textContent=sub;$('splash').classList.remove('hide');setTimeout(()=>$('splash').classList.add('hide'),delay)}
 function authErr(t){$('authError').textContent=t;$('authError').classList.remove('hidden')}
 function setConfigStatus(){const el=$('configStatus');if(!el)return;el.textContent=FIREBASE_READY?'✓ Firebase подключён: Authentication + Firestore + Storage + Realtime':'⚠ Firebase config не настроен'}
 function clearAuthErr(){$('authError').classList.add('hidden')}
@@ -248,8 +257,21 @@ $('authForm').onsubmit=async e=>{e.preventDefault();clearAuthErr();const u=usern
   }finally{btn.disabled=false;btn.textContent=old}};
 
 function setUiOnline(online=true){$('syncState').textContent=online?'realtime':'offline';$('syncState').classList.toggle('hidden',!online)}
-function showMain(){ $('auth').classList.add('hidden');$('main').classList.remove('hidden');setUiOnline(FIREBASE_READY); }
-function showAuth(){ $('main').classList.add('hidden');$('auth').classList.remove('hidden');setMode('login');setConfigStatus(); }
+function showMain(){
+  document.body.classList.remove('sg-preauth');
+  document.body.classList.add('sg-authenticated');
+  $('auth').classList.add('hidden');
+  $('main').classList.remove('hidden');
+  setUiOnline(FIREBASE_READY);
+}
+function showAuth(){
+  document.body.classList.remove('sg-authenticated');
+  document.body.classList.add('sg-preauth');
+  $('main').classList.add('hidden');
+  $('auth').classList.remove('hidden');
+  setMode('login');
+  setConfigStatus();
+}
 
 async function loadProfile(){currentProfile=await ensureUserDoc(currentUser);$('myName').textContent=currentProfile.name||currentProfile.username;$('myHandle').textContent='@'+currentProfile.username;renderAvatar($('myAvatar'),currentProfile.name,currentProfile.photoURL);}
 function renderAvatar(el,name,photo){el.innerHTML=photo?`<img src="${esc(photo)}" alt="">`:esc(initials(name));}
@@ -357,34 +379,32 @@ window.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCa
 if(!auth){
   $('configStatus').innerHTML='<span class="config-pill">Firebase не инициализировался — открой F12 → Console</span>';
   showAuth();
-  $('splashSub').textContent='Ошибка подключения Firebase';
-  setTimeout(()=>$('splash').classList.add('hide'),900);
+  $('splashSub').textContent='Откройте вход в SuperGram';
+  $('splash').classList.add('hide');
 } else {
   $('configStatus').textContent='Firebase Authentication + Firestore + Storage подключены.';
 
-  let authResolved=false;
-  const revealAuthSafely=()=>{
-    if(authResolved)return;
-    authResolved=true;
-    if(!currentUser)showAuth();
-    $('splash').classList.add('hide');
-  };
-
-  // Start listening immediately. This handles both restored sessions and
-  // signed-out users without waiting for Firestore.
+  // Firebase is the source of truth for the session. We never show the
+  // messenger UI while signed out, even for a single frame during startup.
   onAuthStateChanged(auth,user=>{
-    revealAuthSafely();
     if(!user){
-      currentUser=null;currentProfile=null;currentChatId=null;
+      currentUser=null;
+      currentProfile=null;
+      currentChatId=null;
       if(unsubscribeChats)unsubscribeChats();
       if(unsubscribeMessages)unsubscribeMessages();
       if(window.__sgFriendsUnsub)window.__sgFriendsUnsub();
       showAuth();
+      $('splash').classList.add('hide');
       return;
     }
+
     currentUser=user;
     showMain();
-    showSplash('SuperGram запускается…',700);
+    showSplash('SuperGram запускается…',650);
+
+    // Profile, chats and calls initialize in the background so the login
+    // shell never gets blocked by Firestore/network latency.
     Promise.resolve().then(async()=>{
       try{await loadProfile();}catch(e){console.warn('Profile background sync:',e)}
       try{startRealtime();}catch(e){console.warn('Realtime start:',e)}
@@ -396,10 +416,6 @@ if(!auth){
     showAuth();
     $('splash').classList.add('hide');
   });
-
-  // No artificial session timeout here. Firebase Auth decides when the
-  // session state is restored and fires onAuthStateChanged accordingly.
-  // This prevents false 'timeout' errors on slow/mobile connections.
 }
 
 // friends menu: double-click / extra action shortcut
